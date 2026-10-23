@@ -4,6 +4,17 @@ module Msf::DBManager::User
 
   MIN_TOKEN_LENGTH = 20
 
+  # Key used to serialize first-user bootstrap across web service processes.
+  INITIAL_USER_LOCK_KEY = 0x4d5346424f4f54
+
+  # Attributes that an unauthenticated bootstrap may set. Privilege and persistence fields
+  # are deliberately excluded so the bootstrap can only create an administrator with a
+  # password, never an account with a caller-selected role or authentication bypass.
+  INITIAL_USER_ATTRIBUTES = %w[username password fullname email phone company prefs].freeze
+
+  # Raised when the initial user has already been created or another process is creating it.
+  class InitialUserAlreadyExists < StandardError; end
+
   # Returns a list of all users in the database
   def users(opts)
     ::ApplicationRecord.connection_pool.with_connection {
@@ -65,6 +76,42 @@ module Msf::DBManager::User
 
       user
     }
+  end
+
+  # Creates the first web service user as an administrator.
+  #
+  # The caller must have already verified the one-time setup token. This method serializes
+  # bootstrap across processes, rechecks the users table inside the transaction, and forces
+  # administrator privileges so client-supplied bootstrap data cannot choose its own role
+  # or persistence token.
+  #
+  # @param opts [Hash] user attributes; must include :username and :password.
+  # @return [Mdm::User] the created administrator.
+  # @raise [ArgumentError] if :username or :password is missing.
+  # @raise [InitialUserAlreadyExists] if a user exists or another bootstrap is in progress.
+  def report_initial_user(opts)
+    raise Rex::RuntimeError, 'Database is not active' unless active
+    raise ArgumentError, 'Missing required option :username' if opts[:username].nil?
+    raise ArgumentError, 'Missing required option :password' if opts[:password].nil?
+
+    ::ApplicationRecord.transaction do
+      lock_acquired = ::ApplicationRecord.connection.select_value(
+        "SELECT pg_try_advisory_xact_lock(#{INITIAL_USER_LOCK_KEY})"
+      )
+      unless [true, 't', 'true', '1', 1].include?(lock_acquired)
+        raise InitialUserAlreadyExists, 'Initial user creation is already in progress'
+      end
+      raise InitialUserAlreadyExists, 'An initial user already exists' if Mdm::User.exists?
+
+      initial_user_opts = opts.each_with_object({}) do |(key, value), allowed|
+        allowed[key.to_s.to_sym] = value if INITIAL_USER_ATTRIBUTES.include?(key.to_s)
+      end
+      initial_user_opts[:admin] = true
+      user = report_user(initial_user_opts)
+      raise Rex::RuntimeError, 'Failed to create the initial user' if user.nil?
+
+      user
+    end
   end
 
   # Update the attributes of a user entry with the values in opts.

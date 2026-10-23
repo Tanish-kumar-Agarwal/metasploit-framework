@@ -37,10 +37,17 @@ module Msf::WebServices::UserServlet
   def self.report_user
     lambda {
       warden.authenticate!(scope: :admin_api)
+      bootstrap = request.env['msf.bootstrap'] == true
       job = lambda { |opts|
-        get_db.report_user(opts)
+        begin
+          user = bootstrap ? get_db.report_initial_user(opts) : get_db.report_user(opts)
+          mark_auth_initialized! if bootstrap && user
+          user
+        rescue Msf::DBManager::User::InitialUserAlreadyExists => e
+          throw(:warden, message: e.message, code: 409)
+        end
       }
-      exec_report_job(request, &job)
+      exec_report_job(request, allow_async: !bootstrap, &job)
     }
   end
 

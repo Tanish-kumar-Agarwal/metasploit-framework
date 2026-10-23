@@ -50,12 +50,13 @@ module MsfdbHelpers
     end
 
     def run_cmd(cmd, input: nil, env: {})
-      puts "run_cmd: cmd=#{cmd}, input=#{input}, env=#{env}" if @options[:debug]
+      safe_cmd = cmd.gsub(/(--token\s+)\S+/, '\1[REDACTED]')
+      puts "run_cmd: cmd=#{safe_cmd}, input=#{input}, env_keys=#{env.keys.join(',')}" if @options[:debug]
 
       output, status = Open3.capture2e(env, cmd)
       if @options[:debug]
-        puts "'#{cmd}' returned #{status.exitstatus}"
-        puts output
+        puts "'#{safe_cmd}' returned #{status.exitstatus}"
+        puts output.gsub(/(--token\s+)\S+/, '\1[REDACTED]')
       end
       status.exitstatus
     end

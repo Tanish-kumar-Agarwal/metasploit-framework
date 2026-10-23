@@ -51,6 +51,9 @@ require 'msfenv'
 @msf_ws_user = (@current_user || "msfadmin").to_s.strip
 @ws_generated_ssl = false
 @ws_api_token = nil
+@ws_setup_token = nil
+@ws_setup_token_file = nil
+@ws_started_by_this_run = false
 
 @components = %w(database webservice)
 @environments = %w(production development)
@@ -385,9 +388,56 @@ def status_web_service
   end
 end
 
+def create_web_service_setup_token
+  FileUtils.mkdir_p(@localconf)
+  token = SecureRandom.hex(32)
+  path = File.join(@localconf, "#{@ws_tag}-setup-token-#{Process.pid}-#{SecureRandom.hex(8)}")
+  created = false
+  File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+    created = true
+    file.write(token)
+  end
+  File.chmod(0o600, path)
+  @ws_setup_token = token
+  @ws_setup_token_file = File.expand_path(path)
+  true
+rescue StandardError => e
+  File.delete(path) if created && path && File.exist?(path)
+  print_error "Failed to create the MSF web service setup token: #{e.message}"
+  false
+end
+
+def remove_web_service_setup_token
+  path = @ws_setup_token_file
+  if path.nil?
+    @ws_setup_token = nil
+    return true
+  end
+
+  File.delete(path) if File.exist?(path) || File.symlink?(path)
+  @ws_setup_token = nil
+  @ws_setup_token_file = nil
+  true
+rescue StandardError => e
+  print_error "Failed to remove the MSF web service setup token at #{path}: #{e.message}"
+  false
+end
+
+def web_service_env
+  @ws_setup_token_file ? { 'MSF_WS_SETUP_TOKEN_FILE' => @ws_setup_token_file } : {}
+end
+
+def setup_token_headers
+  @ws_setup_token ? { 'X-MSF-Setup-Token' => @ws_setup_token } : {}
+end
+
+def auth_headers
+  @ws_api_token ? { 'Authorization' => "Bearer #{@ws_api_token}" } : {}
+end
+
 def init_web_service
   if web_service_pid_status == WebServicePIDStatus::RUNNING
-    puts "MSF web service is already running as PID #{web_service_pid}"
+    puts "MSF web service is already running as PID #{web_service_pid}; stop it before reinitializing"
     return false
   end
 
@@ -411,18 +461,55 @@ def init_web_service
     generate_web_service_ssl(key: @options[:ssl_key], cert: @options[:ssl_cert])
   end
 
-  if start_web_service(expect_auth: false)
-    if add_web_service_workspace && add_web_service_user
-      output_web_service_information
-    else
+  @ws_started_by_this_run = false
+  @ws_api_token = nil
+  unless create_web_service_setup_token
+    puts 'Failed to create the MSF web service setup token, please reinitialize.'
+    return false
+  end
+
+  success = false
+  begin
+    unless start_web_service(expect_auth: false)
+      puts 'Failed to start the MSF web service, please reinitialize.'
+      return false
+    end
+
+    unless add_web_service_user
       puts 'Failed to complete MSF web service configuration, please reinitialize.'
-      stop_web_service
+      return false
+    end
+
+    unless remove_web_service_setup_token
+      puts 'Failed to remove the MSF web service setup token, please reinitialize.'
+      return false
+    end
+
+    unless add_web_service_workspace
+      puts 'Failed to complete MSF web service configuration, please reinitialize.'
+      return false
+    end
+
+    output_web_service_information
+    success = true
+  ensure
+    cleanup_succeeded = remove_web_service_setup_token
+    success &&= cleanup_succeeded
+    if @ws_started_by_this_run && !success
+      begin
+        stop_web_service
+      rescue StandardError => e
+        print_error "Failed to stop the MSF web service after initialization failed: #{e.message}"
+      end
     end
   end
+
+  success
 end
 
 def start_web_service_daemon(expect_auth:)
-  if @db_driver.run_cmd("#{thin_cmd} start") == 0
+  if @db_driver.run_cmd("#{thin_cmd} start", env: web_service_env) == 0
+    @ws_started_by_this_run = true
     # wait until web service is online
     retry_count = 0
     response_data = web_service_online_check(expect_auth: expect_auth)
@@ -490,7 +577,8 @@ def start_web_service(expect_auth: true)
     start_web_service_daemon(expect_auth: expect_auth)
   else
     puts thin_cmd
-    system "#{thin_cmd} start"
+    @ws_started_by_this_run = true
+    system(web_service_env, "#{thin_cmd} start")
   end
 end
 
@@ -549,24 +637,32 @@ def generate_web_service_ssl(key:, cert:)
 end
 
 def web_service_online_check(expect_auth:)
-  msf_version_uri = get_web_service_uri(path: '/api/v1/msf/version')
-  response_data = http_request(uri: msf_version_uri, method: :get,
-                          skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+  health_uri = get_web_service_uri(path: '/api/v1/health')
+  response_data = http_request(uri: health_uri, method: :get,
+                               skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+  response = response_data[:response]
+  health_data = response.is_a?(Hash) ? response[:data] : nil
+  health_status = health_data.is_a?(Hash) ? health_data[:status] : nil
+  error_data = response.is_a?(Hash) ? response[:error] : nil
+  error_code = error_data.is_a?(Hash) ? error_data[:code] : nil
 
   if !response_data[:exception].nil? && response_data[:exception].is_a?(Errno::ECONNREFUSED)
     response_data[:state] = :offline
   elsif !response_data[:exception].nil? && response_data[:exception].is_a?(OpenSSL::OpenSSLError)
     response_data[:state] = :error
     response_data[:message] = 'Detected an SSL issue. Please set the same options used to initialize the web service or reinitialize.'
-  elsif !response_data[:response].nil? && response_data[:response].dig(:error, :code) == 401
+  elsif health_status == 'UP'
+    response_data[:state] = :online
+  elsif health_status == 'DOWN'
+    response_data[:state] = :error
+    response_data[:message] = 'MSF web service is running but its database is unavailable.'
+  elsif error_code == 401
     if expect_auth
       response_data[:state] = :online
     else
       response_data[:state] = :error
       response_data[:message] = 'MSF web service expects authentication. If you wish to reinitialize the web service account you will need to reinitialize the database.'
     end
-  elsif !response_data[:response].nil? && !response_data[:response].dig(:data, :metasploit_version).nil?
-    response_data[:state] = :online
   else
     response_data[:state] = :error
   end
@@ -576,18 +672,39 @@ def web_service_online_check(expect_auth:)
 end
 
 def add_web_service_workspace(name: 'default')
+  if @ws_api_token.nil?
+    print_error "Cannot create the MSF web service workspace '#{name}' without an API token"
+    return false
+  end
+
   # Send request to create new workspace
   workspace_data = { name: name }
   workspaces_uri = get_web_service_uri(path: '/api/v1/workspaces')
   response_data = http_request(uri: workspaces_uri, data: workspace_data, method: :post,
-                               skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+                               headers: auth_headers, skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
   response = response_data[:response]
   puts "add_web_service_workspace: add workspace response=#{response}" if @options[:debug]
-  if response.nil? || response.dig(:data, :name) != name
+  created_workspace = response.is_a?(Hash) ? response[:data] : nil
+  if !created_workspace.is_a?(Hash) || created_workspace[:name] != name
+    if web_service_workspace_exists?(name)
+      puts "MSF web service workspace '#{name}' already exists; reusing it"
+      return true
+    end
+
     print_error "Error creating MSF web service workspace '#{name}'"
     return false
   end
   return true
+end
+
+def web_service_workspace_exists?(name)
+  workspaces_uri = get_web_service_uri(path: '/api/v1/workspaces')
+  response_data = http_request(uri: workspaces_uri, method: :get,
+                               headers: auth_headers, skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+  response = response_data[:response]
+  workspaces = response.is_a?(Hash) ? response[:data] : nil
+  workspaces = [workspaces] if workspaces.is_a?(Hash)
+  Array(workspaces).any? { |workspace| workspace.is_a?(Hash) && workspace[:name] == name }
 end
 
 def add_web_service_user
@@ -600,14 +717,69 @@ def add_web_service_user
   user_data = cred_data.merge({ admin: true })
   user_uri = get_web_service_uri(path: '/api/v1/users')
   response_data = http_request(uri: user_uri, data: user_data, method: :post,
-                          skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+                               headers: setup_token_headers, skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
   response = response_data[:response]
-  puts "add_web_service_user: create user response=#{response}" if @options[:debug]
-  if response.nil? || response.dig(:data, :username) != @msf_ws_user
-    print_error "Error creating MSF web service user #{@msf_ws_user}"
-    return false
+  puts 'add_web_service_user: create user response received' if @options[:debug]
+  created_user = response.is_a?(Hash) ? response[:data] : nil
+
+  if created_user.is_a?(Hash) && created_user[:username] == @msf_ws_user
+    return false unless generate_web_service_token(cred_data)
+    return false unless verify_web_service_admin
+
+    print_web_service_credentials
+    print_web_service_api_token
+    return true
   end
 
+  # Recover from a previous run that created the account but failed before issuing a token.
+  # Do not create or elevate an account when users already exist; prove ownership with the
+  # supplied credentials instead. Existing accounts must already be administrators.
+  if existing_user_response?(response) && generate_web_service_token(cred_data)
+    return false unless verify_web_service_admin
+
+    puts "MSF web service user #{@msf_ws_user} already exists; reusing the existing account"
+    print_web_service_credentials
+    print_web_service_api_token
+    return true
+  end
+
+  print_error "Error creating MSF web service user #{@msf_ws_user}"
+  false
+end
+
+def existing_user_response?(response)
+  error_data = response.is_a?(Hash) ? response[:error] : nil
+  error_data.is_a?(Hash) && [401, 409].include?(error_data[:code])
+end
+
+def verify_web_service_admin
+  users_uri = get_web_service_uri(path: '/api/v1/users')
+  response_data = http_request(uri: users_uri, method: :get,
+                               headers: auth_headers, skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+  response = response_data[:response]
+  return true if response.is_a?(Hash) && response[:data].is_a?(Array)
+
+  print_error "The MSF web service account #{@msf_ws_user} could not be verified as an administrator"
+  false
+end
+
+def generate_web_service_token(cred_data)
+  # Send request to create new API token for the user
+  generate_token_uri = get_web_service_uri(path: '/api/v1/auth/generate-token')
+  response_data = http_request(uri: generate_token_uri, data: cred_data, method: :post,
+                               skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
+  response = response_data[:response]
+  puts 'add_web_service_user: generate token response received' if @options[:debug]
+  token_data = response.is_a?(Hash) ? response[:data] : nil
+  @ws_api_token = token_data.is_a?(Hash) ? token_data[:token] : nil
+  if @ws_api_token.nil?
+    print_error 'Error creating MSF web service user API token'
+    return false
+  end
+  true
+end
+
+def print_web_service_credentials
   puts "\n#{'    ############################################################'.cyan}"
   print "#{'    ##              '.cyan}"
   print"#{'MSF Web Service Credentials'.cyan.bold.underline}"
@@ -619,19 +791,10 @@ def add_web_service_user
 
   puts "\n#{'MSF web service username'.cyan.bold}: #{@msf_ws_user}"
   puts "#{'MSF web service password'.cyan.bold}: #{@msf_ws_pass}"
+end
 
-  # Send request to create new API token for the user
-  generate_token_uri = get_web_service_uri(path: '/api/v1/auth/generate-token')
-  response_data = http_request(uri: generate_token_uri, data: cred_data, method: :post,
-                          skip_verify: skip_ssl_verify?, cert: get_ssl_cert)
-  response = response_data[:response]
-  puts "add_web_service_user: generate token response=#{response}" if @options[:debug]
-  if response.nil? || (@ws_api_token = response.dig(:data, :token)).nil?
-    print_error "Error creating MSF web service user API token"
-    return false
-  end
+def print_web_service_api_token
   puts "#{'MSF web service user API token'.cyan.bold}: #{@ws_api_token}"
-  return true
 end
 
 def output_web_service_information
@@ -1053,6 +1216,7 @@ if File.expand_path($PROGRAM_NAME) == File.expand_path(__FILE__)
     @options[:component] = prompt_for_component(command)
   end
   prompt_for_deletion(command)
+  init_failed = false
   if @options[:component] == :all
     @components.each { |component|
       if component == :webservice
@@ -1060,7 +1224,8 @@ if File.expand_path($PROGRAM_NAME) == File.expand_path(__FILE__)
       end
       puts '===================================================================='
       puts "Running the '#{command}' command for the #{component}:"
-      invoke_command(commands, component.to_sym, command)
+      result = invoke_command(commands, component.to_sym, command)
+      init_failed ||= %i[init reinit].include?(command) && result == false
       puts '===================================================================='
       puts
     }
@@ -1069,6 +1234,9 @@ if File.expand_path($PROGRAM_NAME) == File.expand_path(__FILE__)
     if @options[:component] == :webservice
       3.times { print_webservice_removal_prompt }
     end
-    invoke_command(commands, @options[:component], command)
+    result = invoke_command(commands, @options[:component], command)
+    init_failed ||= %i[init reinit].include?(command) && result == false
   end
+
+  exit(1) if init_failed
 end

@@ -10,6 +10,25 @@ To use the web service you will need a PostgreSQL database to serve as the backe
 #### Initialize the Database and Web Service
 Execute `msfdb init` and respond to prompts during the interactive initialization. The script first creates and configures the database, then it configures the web service, and finally configures the local `msfconsole` with the new data service connection.
 
+During web service initialization, `msfdb` writes a one-time bootstrap token to a `0600` file in the Metasploit configuration directory and passes only that absolute file path to the service through `MSF_WS_SETUP_TOKEN_FILE`. The service uses the token to authorize creation of the first account, then removes the token from the request environment. `msfdb` deletes the token file after the first account is created and fails initialization if the file cannot be removed. The token is required on every bind address, including localhost, and cannot be reused to create another account.
+
+If initialization fails after the web service account was created, the account is intentionally preserved. Stop the service with `msfdb --component webservice stop` if it is still running, then rerun `msfdb --component webservice init`; an existing account is reused only after the supplied credentials generate an API token that can access the administrator-only API. Non-administrator accounts are rejected and are never elevated silently. `msfdb` exits non-zero when web service initialization does not complete. If the failure was removing the setup-token file, delete any stale `msf-ws-setup-token-*` file in the Metasploit configuration directory after stopping the service before rerunning; the next initialization writes a new token file.
+
+For a manually managed service, set `MSF_WS_SETUP_TOKEN_FILE` to an absolute path containing exactly one 64-character lowercase hexadecimal token. The file must be a regular, non-symlink file with mode `0600` and be owned by the service user on POSIX systems. Send the token in the `X-MSF-Setup-Token` header when creating the first account:
+
+```sh
+curl --insecure \
+  -H "Content-Type: application/json" \
+  -H "X-MSF-Setup-Token: <token>" \
+  -d '{"username":"msfadmin","password":"<password>"}' \
+  https://localhost:5443/api/v1/users
+```
+
+The token is accepted only for that first-account request while the users table is empty; it cannot create a second account. Delete the token file after the first account is created. If cleanup fails, stop the service and delete the stale file before retrying. The retired `MSF_WS_SETUP_TOKEN` environment variable is not read.
+
+#### Readiness
+The unauthenticated `GET /api/v1/health` endpoint returns `200` with `{"data":{"status":"UP"}}` when the database is reachable and `503` with `{"data":{"status":"DOWN"}}` otherwise. Use it to wait for the database before creating the first account or a workspace.
+
 #### msfdb
 
 The `msfdb` tool allows you to manage both the Metasploit Framework database and web service components together or independently. If the `--component` option is not provided then the specified command will be executed for the database followed by the web service. This default mode of operation is useful when first setting up the database and web service. The component may be specified if you wish to make changes to a given component independent of the other.
@@ -34,7 +53,7 @@ The `msfdb` tool allows you to manage both the Metasploit Framework database and
 #### Notes
 * SSL is enabled by default and `msfdb` will generate a fake "snakeoil" SSL certificate during initialization using `Rex::Socket::Ssl.ssl_generate_certificate` if one is not provided. The generated SSL certificate uses a random common name (CN) which will not match your hostname, therefore, you will need to make appropriate accommodations when operating the web service with such a certificate. **Please** generate your own SSL certificate and key instead and supply those to `msfdb` using the `--ssl-cert-file` and `--ssl-key-file` options, and enable SSL verification by passing the option `--no-ssl-disable-verify`.
 
-* A simple verification that web service is up and running can be performed using cURL: `curl --insecure -H "Accept: application/json" -H "Authorization: Bearer <token>" https://localhost:5443/api/v1/msf/version`
+* A simple readiness check that does not require credentials can be performed using cURL: `curl --insecure https://localhost:5443/api/v1/health`. To verify the authenticated version endpoint: `curl --insecure -H "Accept: application/json" -H "Authorization: Bearer <token>" https://localhost:5443/api/v1/msf/version`
 
 ### Accessing the API
 The API account can be accessed with your preferred web browser by visiting `https://<address>:<port>/api/v1/auth/account`. If you want to change the API token for your account you can log in to the API account page and generate a new API token. You can find more

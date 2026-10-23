@@ -19,6 +19,10 @@ module Msf::WebServices::Authentication
       # Authenticate the request.
       def authenticate!
         unless auth_initialized?
+          unless request.env['msf.bootstrap'] == true
+            throw(:warden, message: 'Invalid API token.', code: 401)
+          end
+
           return success!({ message: 'Initialize authentication by creating an initial user account.' })
         end
 

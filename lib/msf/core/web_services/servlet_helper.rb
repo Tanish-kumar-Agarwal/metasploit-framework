@@ -65,14 +65,14 @@ module Msf::WebServices::ServletHelper
     set_json_error_response(response: error_response, code: code)
   end
 
-  def exec_report_job(request, includes = nil, &job)
+  def exec_report_job(request, includes = nil, allow_async: true, &job)
     begin
 
       # report jobs always need data
       opts = parse_json_request(request, true)
 
       exec_async = opts.delete(:exec_async)
-      if (exec_async)
+      if (exec_async && allow_async)
         Msf::WebServices::JobProcessor.instance.submit_job(opts, &job)
         return set_empty_response
       else

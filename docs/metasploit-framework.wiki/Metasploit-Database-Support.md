@@ -112,7 +112,9 @@ The username and password are credentials for the API account:
 https://localhost:5443/api/v1/auth/account
 ```
 
-All this information is loaded by Metasploit automatically at startup from the ~/.msf4 folder. You should copy the credentials to a file in case you need them in the future. If you forget or lose the credentials but you can always run `./msfdb reinit` and reset the Web Service authentication details. **Just make sure to say no to the prompt asking you if you want to delete the Database contents!**
+All this information is loaded by Metasploit automatically at startup from the ~/.msf4 folder. You should copy the credentials to a file in case you need them in the future. With the locally managed PostgreSQL database, rerunning `./msfdb --component database reinit` without deleting the database contents preserves the existing account and cannot reset its credentials. To choose new credentials, allow the reinit prompt to delete the database contents (which destroys existing data), initialize the web service with `./msfdb --component webservice init`, or update the account through an authenticated API request.
+
+`msfdb` creates the web service account before the default workspace and only then configures the data service. It uses a one-time `0600` setup-token file to authorize creation of the first account; the token is deleted after the account is created and cannot create a second account. If the token file cannot be deleted, initialization fails. If a run fails after creating the account, the account is preserved. If the web service is still running, run `./msfdb --component webservice stop`, then rerun `./msfdb --component webservice init`; the existing account is reused only if the supplied credentials generate an API token with administrator access. Non-administrator accounts are rejected and are never elevated silently. If cleanup of the setup-token file failed, delete the stale `msf-ws-setup-token-*` file in the Metasploit configuration directory after stopping the web service before rerunning. `msfdb` exits non-zero when web service initialization does not complete.
 
 ## msfdb commands
 
