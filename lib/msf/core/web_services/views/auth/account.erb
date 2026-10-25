@@ -7,13 +7,13 @@
 </head>
 <body>
 
-<script type="text/javascript">
-    function getNewApiToken() {
+<script type="text/javascript" nonce="<%= csp_nonce %>">
+    function getNewApiToken(event) {
+        event.preventDefault();
         loadDoc("POST", "<%= Msf::WebServices::AuthServlet.api_generate_token_path %>", function(xhr) {
             var response = JSON.parse(xhr.responseText);
             document.getElementById("api-token").innerHTML = response.data.token;
         }, errorHandler);
-        event.preventDefault();
     }
 
     function errorHandler(xhr) {
@@ -36,14 +36,27 @@
         xhr.open(method, url, true);
         xhr.send();
     }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        var generateToken = document.getElementById('generate-token');
+        if (generateToken) {
+            generateToken.addEventListener('click', getNewApiToken);
+        }
+
+        document.querySelectorAll('.dropdown-btn').forEach(function(button) {
+            button.addEventListener('click', function(event) {
+                event.preventDefault();
+            });
+        });
+    });
 </script>
 
 <ul>
   <% if warden.authenticated?(:user) %>
     <li class="dropdown-menu">
-      <a href="javascript:void(0)" class="dropdown-btn"><%= warden.user(:user).username %></a>
+      <a href="#" class="dropdown-btn" role="button" aria-haspopup="true"><%= warden.user(:user).username %></a>
       <div class="dropdown-content">
-        <a href="#" onclick="getNewApiToken();">Generate New API Token</a>
+        <a href="#" id="generate-token">Generate New API Token</a>
         <a href="<%= Msf::WebServices::AuthServlet.api_logout_path %>">Log Out</a>
       </div>
     </li>

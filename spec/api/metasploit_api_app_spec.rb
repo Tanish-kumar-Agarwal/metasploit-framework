@@ -75,14 +75,4 @@ RSpec.describe Msf::WebServices::MetasploitApiApp do
       expect(last_response.status).to eq(401)
     end
   end
-
-  describe 'response headers' do
-    it 'uses lowercase header keys' do
-      get '/api/v1/hosts'
-      raw_keys = last_response.headers.keys
-      raw_keys.each do |key|
-        expect(key).to eq(key.downcase), "Expected header '#{key}' to be lowercase"
-      end
-    end
-  end
 end

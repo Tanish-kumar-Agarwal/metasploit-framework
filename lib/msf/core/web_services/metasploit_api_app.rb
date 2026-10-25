@@ -3,6 +3,7 @@ require 'sinatra/base'
 require 'swagger/blocks'
 require 'warden'
 require 'msf/core/web_services/authentication'
+require 'msf/core/web_services/security_headers'
 class Msf::WebServices::MetasploitApiApp < Sinatra::Base
   helpers Msf::WebServices::ServletHelper
 
@@ -52,6 +53,8 @@ class Msf::WebServices::MetasploitApiApp < Sinatra::Base
     # expose the rest of the API unauthenticated.
     request.env['msf.auth_initialized'] = @@auth_initialized || !initial_account_creation?
   end
+
+  use Msf::WebServices::SecurityHeaders
 
   use Warden::Manager do |config|
     # failed authentication is handled by this application
